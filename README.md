@@ -14,7 +14,7 @@ Some other text.
 
 ### ddd
 
-<img width="70" height="20" alt="Untitled" src="https://github.com/user-attachments/assets/bdc43e1c-5d40-4149-b2b7-fca1e731ac1a" />
+![duck](https://github.com/user-attachments/assets/5cfea3c8-c772-4122-aab8-23ed539d1af0)
 
 ### eee
 
