@@ -1,0 +1,173 @@
+#!/usr/bin/python3
+
+"""Continously ping a group of network hosts."""
+
+import socket, select, struct, time, random, itertools
+
+PAYLOAD = random.randbytes(56)
+PERIOD  = 1
+
+def add_checksum(packet):
+    """Compute and add the checksum to an ICMPv4 packet."""
+    checksum = (sum(packet[0::2]) << 8) + sum(packet[1::2])
+    while checksum > 0xFFFF:
+        checksum = (checksum >> 16) + (checksum & 0xFFFF)
+    return packet[0:2] + struct.pack("!H", 0xFFFF - checksum) + packet[4:]
+
+def resolve_addr(host, sock4, sock6):
+    """Convert a DNS host name to the IPv6 or IPv4 address."""
+    try:
+        addr = socket.getaddrinfo(host, None, socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)[0][4]
+        send_request({ 0: None, "addr": addr }, 0, None, sock6)
+        return addr
+    except (socket.gaierror, OSError):
+        try:
+            addr = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)[0][4]
+            send_request({ 0: None, "addr": addr }, 0, sock4, None)
+            return addr
+        except socket.gaierror:
+            return None
+
+def open_socket(version):
+    """Open an ICMPv4 or ICMPv6 socket"""
+    for sock_type in (socket.SOCK_DGRAM, socket.SOCK_RAW):
+        try:
+            match version:
+                case 4: return socket.socket(socket.AF_INET,  sock_type, socket.IPPROTO_ICMP)
+                case 6: return socket.socket(socket.AF_INET6, sock_type, socket.IPPROTO_ICMPV6)
+                case _: raise ValueError
+        except OSError:
+            if sock_type == socket.SOCK_RAW:
+                raise
+    raise AssertionError
+
+def send_request(stat, seq, sock4, sock6):
+    """Send an ICMP echo request"""
+    if stat[seq]:
+        return False
+    try:
+        if len(stat["addr"]) == 4:
+            sock6.sendto(struct.pack("!BBHHH", 128, 0, 0, 0, seq)+PAYLOAD, stat["addr"])
+        else:
+            sock4.sendto(add_checksum(struct.pack("!BBHHH",   8, 0, 0, 0, seq)+PAYLOAD), stat["addr"])
+        stat["sent"] = stat.get("sent", 0) + 1
+        stat[seq] = time.monotonic()
+        stat.pop("error", None)
+    except OSError as e:
+        stat["error"] = e
+    return True
+
+def recv_response(sock):
+    """Receive an ICMP echo response"""
+    resp, addr = sock.recvfrom(1024)
+    v_ihl, _, length = struct.unpack_from("!BBH", resp)
+    if (v_ihl >> 4) == 4 and length == len(resp):
+        resp = resp[4*(v_ihl & 0x0F):]
+    icmp, _, _, _, seq_in = struct.unpack_from("!BBHHH", resp)
+    return (addr, seq_in, resp[8:]) if icmp in [0,129] else (None, None, None)
+
+def ping(hosts):
+    """Ping the given list of network hosts and yield the response stats."""
+
+    with open_socket(4) as sock4, open_socket(6) as sock6:
+        stats = {}
+        for i, host in enumerate(hosts):
+            stat = { "index": i }
+            if addr := resolve_addr(host, sock4, sock6):
+                stat |= { "addr": addr, "ip": addr[0], "recv": 0, "sum": 0, "ts": time.monotonic() } | { seq: None for seq in range(1,65535) }
+                stats[addr] = stat
+            yield stat
+
+        deadline = time.monotonic()
+        for seq_out in itertools.cycle(range(1,65536)):
+            for stat in stats.values():
+                stat[seq_out] = None
+            deadline += PERIOD
+            while time.monotonic() < deadline:
+                for stat in itertools.islice(stats.values(), 1+int(len(stats)*(time.monotonic() - deadline + PERIOD)/PERIOD)):
+                    if send_request(stat, seq_out, sock4, sock6):
+                        yield stat
+                for sock in select.select([sock4, sock6], [], [], 0.001)[0]:
+                    addr, seq_in, payload = recv_response(sock)
+                    if stat := stats.get(addr):
+                        if stat.get(seq_in, 0) > 0 and payload == PAYLOAD:
+                            stat["recv"] += 1
+                            stat["loss"]  = 1-stat["recv"]/stat["sent"]
+                            stat["last"]  = time.monotonic() - stat[seq_in]
+                            stat["sum"]  += stat["last"]
+                            stat["avg"]   = stat["sum"]/stat["recv"]
+                            stat["best"]  = min(stat.get("best", float("inf")), stat["last"])
+                            stat["ts"]    = time.monotonic()
+                            stat[seq_in] = -1
+                            yield stat
+            for stat in stats.values():
+                send_request(stat, seq_out, sock4, sock6)
+                if stat["recv"] or True:
+                    stat["loss"] = 1-stat["recv"]/stat["sent"]
+                yield stat
+
+import curses, ipaddress, sys
+
+def main(screen, hosts):
+    """Use ncurses to display the ping results in a table."""
+    curses.use_default_colors()
+    curses.curs_set(0)
+    curses.set_escdelay(1)
+    curses.init_pair(1, curses.COLOR_RED, -1)
+    screen.nodelay(True)
+    screen.clear()
+
+    columns = { "Sent": 4, "Loss": -6, "Last": -7, "Avg": -7, "Best": -7, "Host": max(map(len,hosts)), "IP": 40, "": 0 }
+    x = dict(zip(columns,itertools.accumulate(columns.values(), lambda a, b: a+1+abs(b), initial=0)))
+    hosts = hosts[:(screen.getmaxyx()[0]-1)*(screen.getmaxyx()[1] // x[""])]
+
+    def screen_large_enough():
+        return screen.getmaxyx()[1] > x[""] and screen.getmaxyx()[0] > 1
+
+    def position(i, column):
+        return 1+(i % (screen.getmaxyx()[0]-1)), (i // (screen.getmaxyx()[0]-1)) * x[""] + x[column]
+
+    def text(column, key, callback):
+        if key in entry and entry[key] is not None:
+            screen.addstr(*position(entry["index"], column), callback(entry[key]))
+
+    def style(column, attr):
+        screen.chgat(*position(entry["index"], column), columns[column], attr)
+
+    if not screen_large_enough():
+        raise OverflowError("screen is too small")
+
+    for column, width in columns.items():
+        for i in range((len(hosts) + (screen.getmaxyx()[0]-1-1)) // (screen.getmaxyx()[0]-1)):
+            screen.addstr(0, i * x[""] + x[column], column.rjust(-width), curses.A_BOLD)
+
+    for i, host in enumerate(hosts):
+        screen.addstr(*position(i, "Host"), host)
+
+    for entry in ping(hosts):
+        if screen.getch() in [ord("q"), ord("Q"), 27]:
+            raise KeyboardInterrupt
+        if not screen_large_enough():
+            continue
+        elif "error" in entry:
+            style("Host", curses.color_pair(1) | curses.A_BOLD)
+        elif "ip" in entry:
+            text("IP",   "ip",   lambda x: ipaddress.ip_address(x).exploded)
+            text("Sent", "sent", lambda x: f"{x:4d}")
+            text("Loss", "loss", lambda x: f"{100*x:5.1f}%")
+            text("Last", "last", lambda x: f"{1000*x:7.1f}")
+            text("Avg",  "avg",  lambda x: f"{1000*x:7.1f}")
+            text("Best", "best", lambda x: f"{1000*x:7.1f}")
+            style("Host", 0 if (time.monotonic() < entry["ts"]+10) else curses.A_BOLD)
+        else:
+            style("Host", curses.color_pair(1) | curses.A_BOLD)
+
+try:
+    if len(sys.argv) > 1:
+        curses.wrapper(main, sys.argv[1:])
+    else:
+        print(f"usage: {sys.argv[0]} [hosts ...]")
+except KeyboardInterrupt:
+    pass
+except Exception as e:
+    print(f"{type(e).__name__}: {e}");
