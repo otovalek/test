@@ -102,11 +102,11 @@ def ping(hosts):
                             yield stat
             for stat in stats.values():
                 send_request(stat, seq_out, sock4, sock6)
-                if stat["recv"] or True:
+                if stat["sent"] > 1 or stat["recv"] > 0:
                     stat["loss"] = 1-stat["recv"]/stat["sent"]
                 yield stat
 
-import curses, ipaddress, sys
+import curses, ipaddress, sys, os
 
 def main(screen, hosts):
     """Use ncurses to display the ping results in a table."""
@@ -149,7 +149,7 @@ def main(screen, hosts):
             raise KeyboardInterrupt
         if not screen_large_enough():
             continue
-        elif "error" in entry:
+        if "error" in entry:
             style("Host", curses.color_pair(1) | curses.A_BOLD)
         elif "ip" in entry:
             text("IP",   "ip",   lambda x: ipaddress.ip_address(x).exploded)
@@ -166,8 +166,8 @@ try:
     if len(sys.argv) > 1:
         curses.wrapper(main, sys.argv[1:])
     else:
-        print(f"usage: {sys.argv[0]} [hosts ...]")
+        print(f"usage: {sys.argv[0].split(os.path.sep)[-1]} [hosts ...]")
 except KeyboardInterrupt:
     pass
-except Exception as e:
-    print(f"{type(e).__name__}: {e}");
+except (ArithmeticError, OSError, RuntimeError, ValueError) as e:
+    print(f"{type(e).__name__}: {e}")
